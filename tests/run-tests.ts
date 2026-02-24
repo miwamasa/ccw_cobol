@@ -1,17 +1,22 @@
 /**
- * Test Suite - Instrumented COBOL Interpreter
- * 
+ * Test Suite - Instrumented COBOL Interpreter + Proof-Carrying Modernization
+ *
  * テストカテゴリ:
  * 1. 型システムのテスト（PIC句解析、固定小数点精度）
  * 2. インタプリタ実行のテスト（MOVE、算術、分岐）
  * 3. トレース収集のテスト（イベントが正しく記録されるか）
  * 4. 暗黙的型変換のテスト（COBOL特有の変換ルール）
+ * 5. Proof-Carrying: プロパティ定義・検証・証明書生成のテスト
  */
 
 import { parsePic, makeFixedDecimal, makeAlphanumeric, decimalToNumber, formatCobolValue, PicClause } from '../src/types';
 import { CobolProgram, DataItemDef } from '../src/ast';
 import { ExecutionTracer, VarInitEvent, ArithmeticEvent, BranchEvent, VarAssignEvent } from '../src/tracer';
 import { CobolInterpreter } from '../src/interpreter';
+import { PropertySet, varRef, lit, binOp, cmp, and } from '../src/properties';
+import { PropertyVerifier, VerificationReport } from '../src/verifier';
+import { ProofCertificateBuilder } from '../src/proof-certificate';
+import { CrossVerifier, TestInput } from '../src/cross-verifier';
 
 // ============================================================
 // テストフレームワーク（軽量）
@@ -428,12 +433,462 @@ describe('Integration: Loan Calculator', () => {
 });
 
 // ============================================================
+// 5. Proof-Carrying: プロパティ検証のテスト
+// ============================================================
+
+describe('Property Definition & Verification', () => {
+  // テスト用プログラム: 簡単な加算プログラム
+  const addProgram = makeSimpleProgram(
+    [
+      { nodeType: 'data-item', level: 1, name: 'WS-A', pic: '9(5)V99', value: 100, children: [] },
+      { nodeType: 'data-item', level: 1, name: 'WS-B', pic: '9(5)V99', value: 50, children: [] },
+    ],
+    [
+      { stmtType: 'perform', paragraphName: 'DO-ADD' },
+      { stmtType: 'stop-run' },
+    ],
+    [{
+      name: 'DO-ADD',
+      statements: [
+        { stmtType: 'add', values: [{ exprType: 'variable', name: 'WS-B' }], to: 'WS-A', rounded: false },
+      ],
+    }]
+  );
+
+  it('should verify DataInvariant (value >= 0)', () => {
+    const props: PropertySet = {
+      programId: 'TEST-PROG', version: '1.0', createdAt: '',
+      properties: [{
+        propertyType: 'data-invariant',
+        id: 'INV-TEST-01',
+        description: 'WS-A >= 0',
+        targetVar: 'WS-A',
+        condition: cmp('>=', varRef('WS-A'), lit(0)),
+        checkAt: 'every-assignment',
+      }],
+    };
+
+    const tracer = new ExecutionTracer();
+    const result = new CobolInterpreter(tracer).execute(addProgram);
+    const verifier = new PropertyVerifier(tracer.getEvents(), result.variables, result.displayOutput);
+    const report = verifier.verify(props);
+
+    assertEqual(report.results.length, 1, 'result count');
+    assertEqual(report.results[0].status, 'passed', 'invariant should pass');
+    assert(report.results[0].eventsChecked > 0, 'should have checked events');
+  });
+
+  it('should detect DataInvariant violation', () => {
+    // WS-A = 100, WS-B = 50, after ADD WS-A = 150
+    // Invariant: WS-A < 120 → should FAIL
+    const props: PropertySet = {
+      programId: 'TEST-PROG', version: '1.0', createdAt: '',
+      properties: [{
+        propertyType: 'data-invariant',
+        id: 'INV-TEST-02',
+        description: 'WS-A < 120 (should fail after add)',
+        targetVar: 'WS-A',
+        condition: cmp('<', varRef('WS-A'), lit(120)),
+        checkAt: 'every-assignment',
+      }],
+    };
+
+    const tracer = new ExecutionTracer();
+    const result = new CobolInterpreter(tracer).execute(addProgram);
+    const verifier = new PropertyVerifier(tracer.getEvents(), result.variables, result.displayOutput);
+    const report = verifier.verify(props);
+
+    assertEqual(report.results[0].status, 'failed', 'invariant should fail');
+    assert(report.results[0].violations.length > 0, 'should have violations');
+  });
+
+  it('should verify Precondition on paragraph call', () => {
+    const props: PropertySet = {
+      programId: 'TEST-PROG', version: '1.0', createdAt: '',
+      properties: [{
+        propertyType: 'precondition',
+        id: 'PRE-TEST-01',
+        description: 'WS-A > 0 before DO-ADD',
+        paragraphName: 'DO-ADD',
+        condition: cmp('>', varRef('WS-A'), lit(0)),
+      }],
+    };
+
+    const tracer = new ExecutionTracer();
+    const result = new CobolInterpreter(tracer).execute(addProgram);
+    const verifier = new PropertyVerifier(tracer.getEvents(), result.variables, result.displayOutput);
+    const report = verifier.verify(props);
+
+    assertEqual(report.results[0].status, 'passed', 'precondition should pass');
+  });
+
+  it('should verify Postcondition after paragraph', () => {
+    // After DO-ADD: WS-A should be 150 (100 + 50)
+    const props: PropertySet = {
+      programId: 'TEST-PROG', version: '1.0', createdAt: '',
+      properties: [{
+        propertyType: 'postcondition',
+        id: 'POST-TEST-01',
+        description: 'WS-A > 100 after DO-ADD',
+        paragraphName: 'DO-ADD',
+        condition: cmp('>', varRef('WS-A'), lit(100)),
+      }],
+    };
+
+    const tracer = new ExecutionTracer();
+    const result = new CobolInterpreter(tracer).execute(addProgram);
+    const verifier = new PropertyVerifier(tracer.getEvents(), result.variables, result.displayOutput);
+    const report = verifier.verify(props);
+
+    assertEqual(report.results[0].status, 'passed', 'postcondition should pass');
+  });
+
+  it('should verify FinalState property', () => {
+    const props: PropertySet = {
+      programId: 'TEST-PROG', version: '1.0', createdAt: '',
+      properties: [{
+        propertyType: 'final-state',
+        id: 'FINAL-TEST-01',
+        description: 'WS-A = 150 at end',
+        targetVar: 'WS-A',
+        expectedValue: 150,
+        tolerance: 0.01,
+      }],
+    };
+
+    const tracer = new ExecutionTracer();
+    const result = new CobolInterpreter(tracer).execute(addProgram);
+    const verifier = new PropertyVerifier(tracer.getEvents(), result.variables, result.displayOutput);
+    const report = verifier.verify(props);
+
+    assertEqual(report.results[0].status, 'passed', 'final state should match');
+  });
+
+  it('should detect FinalState mismatch', () => {
+    const props: PropertySet = {
+      programId: 'TEST-PROG', version: '1.0', createdAt: '',
+      properties: [{
+        propertyType: 'final-state',
+        id: 'FINAL-TEST-02',
+        description: 'WS-A = 999 at end (wrong)',
+        targetVar: 'WS-A',
+        expectedValue: 999,
+        tolerance: 0.01,
+      }],
+    };
+
+    const tracer = new ExecutionTracer();
+    const result = new CobolInterpreter(tracer).execute(addProgram);
+    const verifier = new PropertyVerifier(tracer.getEvents(), result.variables, result.displayOutput);
+    const report = verifier.verify(props);
+
+    assertEqual(report.results[0].status, 'failed', 'final state should fail');
+  });
+});
+
+describe('Loop Bound Verification', () => {
+  it('should pass when loop is within bound', () => {
+    const prog = makeSimpleProgram(
+      [
+        { nodeType: 'data-item', level: 1, name: 'WS-I', pic: '9(3)', value: 0, children: [] },
+        { nodeType: 'data-item', level: 1, name: 'WS-SUM', pic: '9(5)', value: 0, children: [] },
+      ],
+      [{
+        stmtType: 'perform-varying',
+        paragraphName: 'LOOP-BODY',
+        variable: 'WS-I',
+        from: { exprType: 'literal', value: 1 },
+        by: { exprType: 'literal', value: 1 },
+        until: { condType: 'comparison', op: '>', left: { exprType: 'variable', name: 'WS-I' }, right: { exprType: 'literal', value: 5 } },
+      }],
+      [{
+        name: 'LOOP-BODY',
+        statements: [
+          { stmtType: 'add', values: [{ exprType: 'literal', value: 1 }], to: 'WS-SUM', rounded: false },
+        ],
+      }]
+    );
+
+    const props: PropertySet = {
+      programId: 'TEST-PROG', version: '1.0', createdAt: '',
+      properties: [{
+        propertyType: 'loop-bound',
+        id: 'LOOP-TEST-01',
+        description: 'Loop runs at most 10 times',
+        paragraphName: 'LOOP-BODY',
+        maxIterations: 10,
+      }],
+    };
+
+    const tracer = new ExecutionTracer();
+    const result = new CobolInterpreter(tracer).execute(prog);
+    const verifier = new PropertyVerifier(tracer.getEvents(), result.variables, result.displayOutput);
+    const report = verifier.verify(props);
+
+    assertEqual(report.results[0].status, 'passed', 'loop bound should pass');
+  });
+
+  it('should fail when loop exceeds bound', () => {
+    const prog = makeSimpleProgram(
+      [
+        { nodeType: 'data-item', level: 1, name: 'WS-I', pic: '9(3)', value: 0, children: [] },
+        { nodeType: 'data-item', level: 1, name: 'WS-SUM', pic: '9(5)', value: 0, children: [] },
+      ],
+      [{
+        stmtType: 'perform-varying',
+        paragraphName: 'LOOP-BODY',
+        variable: 'WS-I',
+        from: { exprType: 'literal', value: 1 },
+        by: { exprType: 'literal', value: 1 },
+        until: { condType: 'comparison', op: '>', left: { exprType: 'variable', name: 'WS-I' }, right: { exprType: 'literal', value: 5 } },
+      }],
+      [{
+        name: 'LOOP-BODY',
+        statements: [
+          { stmtType: 'add', values: [{ exprType: 'literal', value: 1 }], to: 'WS-SUM', rounded: false },
+        ],
+      }]
+    );
+
+    const props: PropertySet = {
+      programId: 'TEST-PROG', version: '1.0', createdAt: '',
+      properties: [{
+        propertyType: 'loop-bound',
+        id: 'LOOP-TEST-02',
+        description: 'Loop runs at most 3 times (too tight)',
+        paragraphName: 'LOOP-BODY',
+        maxIterations: 3,
+      }],
+    };
+
+    const tracer = new ExecutionTracer();
+    const result = new CobolInterpreter(tracer).execute(prog);
+    const verifier = new PropertyVerifier(tracer.getEvents(), result.variables, result.displayOutput);
+    const report = verifier.verify(props);
+
+    assertEqual(report.results[0].status, 'failed', 'loop bound should fail');
+  });
+});
+
+describe('Relational Property Verification', () => {
+  it('should verify variable relationship with tolerance', () => {
+    // WS-A = 100, WS-B = 50, after ADD WS-A = 150
+    // Relation: WS-A = WS-B + 100 (after DO-ADD: 150 = 50 + 100)
+    const prog = makeSimpleProgram(
+      [
+        { nodeType: 'data-item', level: 1, name: 'WS-A', pic: '9(5)V99', value: 100, children: [] },
+        { nodeType: 'data-item', level: 1, name: 'WS-B', pic: '9(5)V99', value: 50, children: [] },
+      ],
+      [
+        { stmtType: 'perform', paragraphName: 'DO-ADD' },
+        { stmtType: 'stop-run' },
+      ],
+      [{
+        name: 'DO-ADD',
+        statements: [
+          { stmtType: 'add', values: [{ exprType: 'variable', name: 'WS-B' }], to: 'WS-A', rounded: false },
+        ],
+      }]
+    );
+
+    const props: PropertySet = {
+      programId: 'TEST-PROG', version: '1.0', createdAt: '',
+      properties: [{
+        propertyType: 'relational',
+        id: 'REL-TEST-01',
+        description: 'WS-A = WS-B + 100 after DO-ADD',
+        condition: cmp('=', varRef('WS-A'), binOp('+', varRef('WS-B'), lit(100))),
+        tolerance: 0.01,
+        checkAfterParagraph: 'DO-ADD',
+      }],
+    };
+
+    const tracer = new ExecutionTracer();
+    const result = new CobolInterpreter(tracer).execute(prog);
+    const verifier = new PropertyVerifier(tracer.getEvents(), result.variables, result.displayOutput);
+    const report = verifier.verify(props);
+
+    assertEqual(report.results[0].status, 'passed', 'relational property should pass');
+  });
+});
+
+describe('Precision Property Verification', () => {
+  it('should verify rounding mode requirement', () => {
+    const prog = makeSimpleProgram(
+      [
+        { nodeType: 'data-item', level: 1, name: 'WS-RATE', pic: '9(2)V9(6)', children: [] },
+        { nodeType: 'data-item', level: 1, name: 'WS-INPUT', pic: '9(2)V9(4)', value: 3.5, children: [] },
+      ],
+      [{ stmtType: 'perform', paragraphName: 'CALC' }],
+      [{
+        name: 'CALC',
+        statements: [{
+          stmtType: 'compute', target: 'WS-RATE', rounded: true,
+          expression: {
+            exprType: 'binary', op: '/',
+            left: { exprType: 'variable', name: 'WS-INPUT' },
+            right: { exprType: 'literal', value: 1200 },
+          },
+        }],
+      }]
+    );
+
+    const props: PropertySet = {
+      programId: 'TEST-PROG', version: '1.0', createdAt: '',
+      properties: [{
+        propertyType: 'precision',
+        id: 'PREC-TEST-01',
+        description: 'WS-RATE uses ROUNDED mode',
+        targetVar: 'WS-RATE',
+        minDecimalPlaces: 6,
+        roundingMode: 'must-round',
+      }],
+    };
+
+    const tracer = new ExecutionTracer();
+    const result = new CobolInterpreter(tracer).execute(prog);
+    const verifier = new PropertyVerifier(tracer.getEvents(), result.variables, result.displayOutput);
+    const report = verifier.verify(props);
+
+    assertEqual(report.results[0].status, 'passed', 'precision property should pass');
+  });
+});
+
+describe('Proof Certificate Generation', () => {
+  it('should generate valid certificate when all properties pass', () => {
+    const prog = makeSimpleProgram(
+      [
+        { nodeType: 'data-item', level: 1, name: 'WS-A', pic: '9(5)V99', value: 100, children: [] },
+        { nodeType: 'data-item', level: 1, name: 'WS-B', pic: '9(5)V99', value: 50, children: [] },
+      ],
+      [
+        { stmtType: 'perform', paragraphName: 'DO-ADD' },
+        { stmtType: 'stop-run' },
+      ],
+      [{
+        name: 'DO-ADD',
+        statements: [
+          { stmtType: 'add', values: [{ exprType: 'variable', name: 'WS-B' }], to: 'WS-A', rounded: false },
+        ],
+      }]
+    );
+
+    const props: PropertySet = {
+      programId: 'TEST-PROG', version: '1.0', createdAt: '',
+      properties: [
+        {
+          propertyType: 'data-invariant', id: 'INV-1',
+          description: 'WS-A >= 0', targetVar: 'WS-A',
+          condition: cmp('>=', varRef('WS-A'), lit(0)), checkAt: 'every-assignment',
+        },
+        {
+          propertyType: 'final-state', id: 'FINAL-1',
+          description: 'WS-A = 150', targetVar: 'WS-A',
+          expectedValue: 150, tolerance: 0.01,
+        },
+      ],
+    };
+
+    const tracer = new ExecutionTracer();
+    const result = new CobolInterpreter(tracer).execute(prog);
+    const verifier = new PropertyVerifier(tracer.getEvents(), result.variables, result.displayOutput);
+    const report = verifier.verify(props);
+
+    const cert = new ProofCertificateBuilder('TEST-PROG', 'TypeScript', props, report)
+      .withSourceOutput(result.displayOutput)
+      .build();
+
+    assertEqual(cert.status, 'valid', 'certificate should be valid');
+    assertEqual(cert.summary.totalProperties, 2, 'total properties');
+    assertEqual(cert.summary.preservedProperties, 2, 'preserved properties');
+    assert(cert.summary.preservationRate === 1.0, 'preservation rate should be 100%');
+  });
+
+  it('should generate partial certificate when some properties fail', () => {
+    const prog = makeSimpleProgram(
+      [{ nodeType: 'data-item', level: 1, name: 'WS-A', pic: '9(5)V99', value: 100, children: [] }],
+      [{ stmtType: 'stop-run' }],
+    );
+
+    const props: PropertySet = {
+      programId: 'TEST-PROG', version: '1.0', createdAt: '',
+      properties: [
+        {
+          propertyType: 'data-invariant', id: 'INV-PASS',
+          description: 'WS-A >= 0', targetVar: 'WS-A',
+          condition: cmp('>=', varRef('WS-A'), lit(0)), checkAt: 'at-end',
+        },
+        {
+          propertyType: 'final-state', id: 'FINAL-FAIL',
+          description: 'WS-A = 999 (wrong)', targetVar: 'WS-A',
+          expectedValue: 999, tolerance: 0.01,
+        },
+      ],
+    };
+
+    const tracer = new ExecutionTracer();
+    const result = new CobolInterpreter(tracer).execute(prog);
+    const verifier = new PropertyVerifier(tracer.getEvents(), result.variables, result.displayOutput);
+    const report = verifier.verify(props);
+
+    const cert = new ProofCertificateBuilder('TEST-PROG', 'TypeScript', props, report)
+      .withSourceOutput(result.displayOutput)
+      .build();
+
+    assertEqual(cert.status, 'partial', 'certificate should be partial');
+    assertEqual(cert.summary.violatedProperties, 1, 'violated count');
+  });
+});
+
+describe('Cross Verification', () => {
+  it('should verify properties across multiple inputs', () => {
+    const prog = makeSimpleProgram(
+      [
+        { nodeType: 'data-item', level: 1, name: 'WS-A', pic: '9(5)V99', value: 100, children: [] },
+        { nodeType: 'data-item', level: 1, name: 'WS-B', pic: '9(5)V99', value: 50, children: [] },
+      ],
+      [
+        { stmtType: 'perform', paragraphName: 'DO-ADD' },
+        { stmtType: 'stop-run' },
+      ],
+      [{
+        name: 'DO-ADD',
+        statements: [
+          { stmtType: 'add', values: [{ exprType: 'variable', name: 'WS-B' }], to: 'WS-A', rounded: false },
+        ],
+      }]
+    );
+
+    const props: PropertySet = {
+      programId: 'TEST-PROG', version: '1.0', createdAt: '',
+      properties: [{
+        propertyType: 'data-invariant', id: 'INV-CROSS',
+        description: 'WS-A >= 0', targetVar: 'WS-A',
+        condition: cmp('>=', varRef('WS-A'), lit(0)), checkAt: 'every-assignment',
+      }],
+    };
+
+    const testInputs: TestInput[] = [
+      { name: 'Small values', overrides: new Map([['WS-A', 10], ['WS-B', 5]]) },
+      { name: 'Large values', overrides: new Map([['WS-A', 99999], ['WS-B', 1]]) },
+    ];
+
+    const crossVerifier = new CrossVerifier(prog, props);
+    const suite = crossVerifier.verifyWithTestInputs(testInputs);
+
+    assertEqual(suite.testResults.length, 2, 'test result count');
+    assert(suite.mainCertificate.status === 'valid', 'main certificate should be valid');
+    assert(suite.allValid, 'all tests should be valid');
+  });
+});
+
+// ============================================================
 // 結果出力
 // ============================================================
 
-console.log('\n══════════════════════════════════════════════');
-console.log('  COBOL Instrumented Interpreter - Test Suite');
-console.log('══════════════════════════════════════════════');
+console.log('\n══════════════════════════════════════════════════════════════');
+console.log('  COBOL Instrumented Interpreter + Proof-Carrying Test Suite');
+console.log('══════════════════════════════════════════════════════════════');
 
 // テスト実行（describeブロックは定義時に実行される）
 

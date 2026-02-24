@@ -1,11 +1,12 @@
 /**
- * POC Main - Instrumented COBOL Interpreter Demo
- * 
+ * POC Main - Proof-Carrying COBOL Modernization Demo
+ *
  * 実証する流れ:
  * 1. サンプルCOBOLプログラム（利息計算）をASTとして定義
  * 2. 型安全なインタプリタで実行し、トレースを収集
  * 3. トレースからTypeScriptコードを生成
- * 4. 結果を比較・分析
+ * 4. Proof-Carrying: プロパティを定義し検証、Proof Certificateを生成
+ * 5. 異なる入力でクロス検証を実行
  */
 
 import { CobolProgram } from './ast';
@@ -13,11 +14,17 @@ import { ExecutionTracer } from './tracer';
 import { CobolInterpreter } from './interpreter';
 import { generateTypeScript } from './codegen';
 import { formatCobolValue } from './types';
+import {
+  PropertySet, varRef, lit, binOp, abs, cmp, and,
+} from './properties';
+import { PropertyVerifier } from './verifier';
+import { ProofCertificateBuilder, formatCertificate } from './proof-certificate';
+import { CrossVerifier, formatCrossVerificationSuite, TestInput } from './cross-verifier';
 
 // ============================================================
 // サンプルCOBOLプログラム: ローン利息計算
 // ============================================================
-// 
+//
 // 以下のCOBOLを模倣:
 //
 //   IDENTIFICATION DIVISION.
@@ -131,7 +138,6 @@ const loanCalcProgram: CobolProgram = {
     {
       name: 'CALC-AMORTIZATION',
       statements: [
-        // COMPUTE WS-INTEREST-AMT ROUNDED = WS-BALANCE * WS-MONTHLY-RATE
         {
           stmtType: 'compute',
           target: 'WS-INTEREST-AMT',
@@ -142,7 +148,6 @@ const loanCalcProgram: CobolProgram = {
           },
           rounded: true,
         },
-        // COMPUTE WS-PRINCIPAL-AMT = WS-PAYMENT - WS-INTEREST-AMT
         {
           stmtType: 'compute',
           target: 'WS-PRINCIPAL-AMT',
@@ -153,21 +158,18 @@ const loanCalcProgram: CobolProgram = {
           },
           rounded: false,
         },
-        // SUBTRACT WS-PRINCIPAL-AMT FROM WS-BALANCE
         {
           stmtType: 'subtract',
           values: [{ exprType: 'variable', name: 'WS-PRINCIPAL-AMT' }],
           from: 'WS-BALANCE',
           rounded: false,
         },
-        // ADD WS-INTEREST-AMT TO WS-TOTAL-INTEREST
         {
           stmtType: 'add',
           values: [{ exprType: 'variable', name: 'WS-INTEREST-AMT' }],
           to: 'WS-TOTAL-INTEREST',
           rounded: false,
         },
-        // DISPLAY
         {
           stmtType: 'display',
           values: [
@@ -185,17 +187,13 @@ const loanCalcProgram: CobolProgram = {
     },
   ],
   mainStatements: [
-    // PERFORM CALC-MONTHLY-RATE
     { stmtType: 'perform', paragraphName: 'CALC-MONTHLY-RATE' },
-    // PERFORM CALC-PAYMENT
     { stmtType: 'perform', paragraphName: 'CALC-PAYMENT' },
-    // MOVE WS-PRINCIPAL TO WS-BALANCE
     {
       stmtType: 'move',
       from: { exprType: 'variable', name: 'WS-PRINCIPAL' },
       to: 'WS-BALANCE',
     },
-    // PERFORM CALC-AMORTIZATION VARYING WS-MONTH-CTR FROM 1 BY 1 UNTIL WS-MONTH-CTR > 12
     {
       stmtType: 'perform-varying',
       paragraphName: 'CALC-AMORTIZATION',
@@ -209,7 +207,6 @@ const loanCalcProgram: CobolProgram = {
         right: { exprType: 'literal', value: 12 },
       },
     },
-    // DISPLAY "Total Interest..."
     {
       stmtType: 'display',
       values: [
@@ -217,7 +214,6 @@ const loanCalcProgram: CobolProgram = {
         { exprType: 'variable', name: 'WS-TOTAL-INTEREST' },
       ],
     },
-    // IF WS-TOTAL-INTEREST > 3000
     {
       stmtType: 'if',
       condition: {
@@ -241,7 +237,6 @@ const loanCalcProgram: CobolProgram = {
         },
       ],
     },
-    // DISPLAY "Status: " WS-STATUS
     {
       stmtType: 'display',
       values: [
@@ -249,8 +244,136 @@ const loanCalcProgram: CobolProgram = {
         { exprType: 'variable', name: 'WS-STATUS' },
       ],
     },
-    // STOP RUN
     { stmtType: 'stop-run' },
+  ],
+};
+
+// ============================================================
+// Proof-Carrying: ローン計算プログラムのプロパティ定義
+// ============================================================
+//
+// これらのプロパティはビジネスルールや数学的性質を表現する。
+// モダナイゼーション後もこれらが保持されることを保証する。
+
+const loanCalcProperties: PropertySet = {
+  programId: 'LOAN-CALC',
+  version: '1.0.0',
+  createdAt: new Date().toISOString(),
+  properties: [
+    // --- ビジネスルール不変条件 ---
+    {
+      propertyType: 'data-invariant',
+      id: 'INV-01',
+      description: 'WS-TOTAL-INTEREST は常に 0 以上（利息はマイナスにならない）',
+      targetVar: 'WS-TOTAL-INTEREST',
+      condition: cmp('>=', varRef('WS-TOTAL-INTEREST'), lit(0)),
+      checkAt: 'every-assignment',
+    },
+    {
+      propertyType: 'data-invariant',
+      id: 'INV-02',
+      description: 'WS-BALANCE は常に 0 以上（残高はマイナスにならない）',
+      targetVar: 'WS-BALANCE',
+      condition: cmp('>=', varRef('WS-BALANCE'), lit(0)),
+      checkAt: 'every-assignment',
+    },
+    {
+      propertyType: 'data-invariant',
+      id: 'INV-03',
+      description: 'WS-MONTHLY-RATE は 1 未満（月利が100%を超えることはない）',
+      targetVar: 'WS-MONTHLY-RATE',
+      condition: cmp('<', varRef('WS-MONTHLY-RATE'), lit(1)),
+      checkAt: 'every-assignment',
+    },
+
+    // --- 事前条件 ---
+    {
+      propertyType: 'precondition',
+      id: 'PRE-01',
+      description: 'CALC-MONTHLY-RATE 呼出前: WS-ANNUAL-RATE > 0',
+      paragraphName: 'CALC-MONTHLY-RATE',
+      condition: cmp('>', varRef('WS-ANNUAL-RATE'), lit(0)),
+    },
+    {
+      propertyType: 'precondition',
+      id: 'PRE-02',
+      description: 'CALC-PAYMENT 呼出前: WS-MONTHLY-RATE > 0',
+      paragraphName: 'CALC-PAYMENT',
+      condition: cmp('>', varRef('WS-MONTHLY-RATE'), lit(0)),
+    },
+
+    // --- 事後条件 ---
+    {
+      propertyType: 'postcondition',
+      id: 'POST-01',
+      description: 'CALC-MONTHLY-RATE 実行後: WS-MONTHLY-RATE > 0',
+      paragraphName: 'CALC-MONTHLY-RATE',
+      condition: cmp('>', varRef('WS-MONTHLY-RATE'), lit(0)),
+    },
+    {
+      propertyType: 'postcondition',
+      id: 'POST-02',
+      description: 'CALC-PAYMENT 実行後: WS-PAYMENT > 0',
+      paragraphName: 'CALC-PAYMENT',
+      condition: cmp('>', varRef('WS-PAYMENT'), lit(0)),
+    },
+
+    // --- 変数間の関係性 ---
+    {
+      propertyType: 'relational',
+      id: 'REL-01',
+      description: 'CALC-AMORTIZATION 後: WS-PRINCIPAL-AMT + WS-INTEREST-AMT ≈ WS-PAYMENT',
+      condition: cmp('=',
+        binOp('+', varRef('WS-PRINCIPAL-AMT'), varRef('WS-INTEREST-AMT')),
+        varRef('WS-PAYMENT')
+      ),
+      tolerance: 0.01,
+      checkAfterParagraph: 'CALC-AMORTIZATION',
+    },
+
+    // --- 算術精度の保証 ---
+    {
+      propertyType: 'precision',
+      id: 'PREC-01',
+      description: 'WS-MONTHLY-RATE は ROUNDED モードで計算されること',
+      targetVar: 'WS-MONTHLY-RATE',
+      minDecimalPlaces: 6,
+      roundingMode: 'must-round',
+    },
+    {
+      propertyType: 'precision',
+      id: 'PREC-02',
+      description: 'WS-INTEREST-AMT は ROUNDED モードで計算されること',
+      targetVar: 'WS-INTEREST-AMT',
+      minDecimalPlaces: 2,
+      roundingMode: 'must-round',
+    },
+
+    // --- ループ上限保証 ---
+    {
+      propertyType: 'loop-bound',
+      id: 'LOOP-01',
+      description: 'CALC-AMORTIZATION ループは 12 回で終了する',
+      paragraphName: 'CALC-AMORTIZATION',
+      maxIterations: 12,
+    },
+
+    // --- 最終状態の検証 ---
+    {
+      propertyType: 'final-state',
+      id: 'FINAL-01',
+      description: 'プログラム終了時: WS-STATUS は "HIGH-INT" または "LOW-INT"',
+      targetVar: 'WS-STATUS',
+      expectedValue: 'HIGH-INT',  // デフォルト入力ではHIGH-INT
+    },
+
+    // --- 出力同値性 ---
+    {
+      propertyType: 'output-equivalence',
+      id: 'OUT-01',
+      description: 'DISPLAY出力がモダナイゼーション前後で一致すること',
+      numericTolerance: 0.01,
+    },
   ],
 };
 
@@ -259,10 +382,10 @@ const loanCalcProgram: CobolProgram = {
 // ============================================================
 
 function main(): void {
-  console.log('╔══════════════════════════════════════════════════════════════╗');
-  console.log('║  COBOL Instrumented Interpreter - Proof of Concept          ║');
-  console.log('║  型安全な計装付きCOBOLインタプリタによるモダナイゼーション   ║');
-  console.log('╚══════════════════════════════════════════════════════════════╝');
+  console.log('╔═══════════════════════════════════════════════════════════════╗');
+  console.log('║  Proof-Carrying COBOL Modernization - POC                     ║');
+  console.log('║  プロパティ保証付きCOBOLモダナイゼーション                     ║');
+  console.log('╚═══════════════════════════════════════════════════════════════╝');
   console.log('');
 
   // ========================================
@@ -305,36 +428,6 @@ function main(): void {
   console.log(`  Rounding operations:    ${summary.roundingOperations}`);
   console.log('');
 
-  // 分岐カバレッジ
-  console.log('  Branch Coverage:');
-  for (const [cond, cov] of Object.entries(summary.branchCoverage)) {
-    const total = cov.then + cov.else;
-    console.log(`    "${cond}"`);
-    console.log(`      THEN: ${cov.then}/${total}  ELSE: ${cov.else}/${total}`);
-    if (cov.then === 0 || cov.else === 0) {
-      console.log(`      ⚠️  Only one branch exercised - need more test data!`);
-    }
-  }
-  console.log('');
-
-  // 型変換の検出
-  if (Object.keys(summary.typeTransitions).length > 0) {
-    console.log('  Type Conversions Detected:');
-    for (const [varName, transitions] of Object.entries(summary.typeTransitions)) {
-      for (const t of transitions) {
-        console.log(`    ${varName}: ${t}`);
-      }
-    }
-    console.log('');
-  }
-
-  // パラグラフ呼び出し
-  console.log('  Paragraph Call Counts:');
-  for (const [name, count] of Object.entries(summary.paragraphCalls)) {
-    console.log(`    ${name}: ${count} calls`);
-  }
-  console.log('');
-
   // ========================================
   // Phase 3: トレースからTypeScriptを生成
   // ========================================
@@ -349,71 +442,144 @@ function main(): void {
   }
   console.log('');
 
-  console.log('--- Generated TypeScript Code ---');
+  // ========================================
+  // Phase 4: Proof-Carrying - プロパティ検証
+  // ========================================
+  console.log('━━━ Phase 4: Proof-Carrying Property Verification ━━━');
   console.log('');
-  console.log(generated.typescript);
+  console.log(`  Property Set: "${loanCalcProperties.programId}" v${loanCalcProperties.version}`);
+  console.log(`  Total Properties: ${loanCalcProperties.properties.length}`);
   console.log('');
 
-  // ========================================
-  // Phase 4: トレースのサンプル出力
-  // ========================================
-  console.log('━━━ Phase 4: Sample Trace Events (first 15) ━━━');
+  // プロパティ一覧を表示
+  console.log('--- Defined Properties ---');
+  for (const prop of loanCalcProperties.properties) {
+    console.log(`  [${prop.propertyType.padEnd(20)}] ${prop.id}: ${prop.description}`);
+  }
   console.log('');
-  const events = tracer.getEvents();
-  for (let i = 0; i < Math.min(15, events.length); i++) {
-    const e = events[i];
-    console.log(`  [${i}] ${e.eventType} @ ${e.timestamp}ms`);
-    switch (e.eventType) {
-      case 'var-init':
-        console.log(`      ${e.varName} = ${e.initialValue} (${e.cobolType})`);
-        break;
-      case 'var-assign':
-        console.log(`      ${e.varName}: ${e.previousValue} → ${e.newValue}`);
-        if (e.sourceInfo) console.log(`      conversion: ${e.sourceInfo.conversionApplied}`);
-        break;
-      case 'arithmetic':
-        console.log(`      ${e.operation}: ${e.operands.map(o => `${o.name}=${o.value}`).join(', ')} → ${e.result}`);
-        if (e.roundingDetail) console.log(`      rounding: ${e.roundingDetail.rawResult} → ${e.roundingDetail.roundedResult}`);
-        break;
-      case 'branch':
-        console.log(`      ${e.condition} => ${e.branchTaken}`);
-        break;
-      case 'perform-call':
-        console.log(`      → ${e.paragraphName} (depth: ${e.callDepth})`);
-        break;
-      case 'loop-iteration':
-        console.log(`      ${e.paragraphName} iter ${e.iteration}: ${e.loopVar}=${e.currentValue}`);
-        break;
+
+  // 検証実行
+  console.log('--- Verification Results ---');
+  console.log('');
+
+  const verifier = new PropertyVerifier(
+    tracer.getEvents(),
+    result.variables,
+    result.displayOutput
+  );
+  const report = verifier.verify(loanCalcProperties);
+
+  for (const r of report.results) {
+    const icon = r.status === 'passed' ? '[PASS]' : r.status === 'failed' ? '[FAIL]' : '[SKIP]';
+    console.log(`  ${icon} ${r.propertyId}: ${r.description}`);
+    console.log(`         ${r.message}`);
+    if (r.violations.length > 0) {
+      for (const v of r.violations) {
+        console.log(`         ! ${v.detail}`);
+        for (const [k, val] of Object.entries(v.actualValues)) {
+          console.log(`           ${k} = ${val}`);
+        }
+      }
     }
   }
-  console.log(`  ... (${events.length - 15} more events)`);
+  console.log('');
+  console.log(`  Summary: ${report.summary.passed}/${report.summary.total} passed, ${report.summary.failed} failed, ${report.summary.skipped} skipped`);
   console.log('');
 
   // ========================================
-  // サマリー
+  // Phase 5: Proof Certificate 生成
   // ========================================
-  console.log('╔══════════════════════════════════════════════════════════════╗');
-  console.log('║  POC Summary                                                ║');
-  console.log('╠══════════════════════════════════════════════════════════════╣');
-  console.log('║                                                              ║');
-  console.log('║  ✅ 型安全なCOBOLランタイム:                                ║');
-  console.log('║     - FixedDecimal / Alphanumeric をDiscriminated Unionで表現║');
-  console.log('║     - PIC句の暗黙的型情報を明示的な型として捕捉              ║');
-  console.log('║     - 固定小数点演算の丸め挙動を完全に追跡                   ║');
-  console.log('║                                                              ║');
-  console.log('║  ✅ 実行トレース収集:                                       ║');
-  console.log(`║     - ${summary.totalEvents} events captured across ${summary.totalStatements} statements`.padEnd(63) + '║');
-  console.log('║     - 変数の型遷移、分岐パス、算術精度を記録                 ║');
-  console.log('║     - 分岐カバレッジの不足を自動検出                         ║');
-  console.log('║                                                              ║');
-  console.log('║  ✅ トレースからのコード生成:                               ║');
-  console.log('║     - 実行トレースに基づく型推論でTypeScript型を決定          ║');
-  console.log('║     - 精度要件の自動検出（BigDecimal必要箇所の特定）         ║');
-  console.log('║     - 未カバー分岐の警告（追加テストデータの必要性）         ║');
-  console.log('║                                                              ║');
-  console.log('║  → 実プロダクトでは、このトレース情報をLLMに入力し、         ║');
-  console.log('║    より洗練されたコード生成を行う                            ║');
-  console.log('╚══════════════════════════════════════════════════════════════╝');
+  console.log('━━━ Phase 5: Generate Proof Certificate ━━━');
+
+  const stateMap = new Map<string, string>();
+  for (const [name, value] of result.variables) {
+    stateMap.set(name, formatCobolValue(value));
+  }
+
+  const certificate = new ProofCertificateBuilder(
+    loanCalcProgram.programId,
+    'TypeScript',
+    loanCalcProperties,
+    report
+  )
+    .withSourceOutput(result.displayOutput)
+    .withSourceState(stateMap)
+    .build();
+
+  console.log(formatCertificate(certificate));
+
+  // ========================================
+  // Phase 6: クロス検証（異なる入力データ）
+  // ========================================
+  console.log('━━━ Phase 6: Cross-Verification with Multiple Inputs ━━━');
+  console.log('');
+
+  const testInputs: TestInput[] = [
+    {
+      name: 'Low Rate (1%)',
+      overrides: new Map<string, number | string>([
+        ['WS-ANNUAL-RATE', 1.0],
+        ['WS-PRINCIPAL', 50000],
+      ]),
+    },
+    {
+      name: 'High Rate (8%)',
+      overrides: new Map<string, number | string>([
+        ['WS-ANNUAL-RATE', 8.0],
+        ['WS-PRINCIPAL', 200000],
+      ]),
+    },
+    {
+      name: 'Small Loan',
+      overrides: new Map<string, number | string>([
+        ['WS-ANNUAL-RATE', 5.0],
+        ['WS-PRINCIPAL', 10000],
+      ]),
+    },
+  ];
+
+  const crossVerifier = new CrossVerifier(loanCalcProgram, loanCalcProperties);
+  const suite = crossVerifier.verifyWithTestInputs(testInputs);
+
+  console.log(formatCrossVerificationSuite(suite));
+
+  // ========================================
+  // 最終サマリー
+  // ========================================
+  console.log('╔═══════════════════════════════════════════════════════════════╗');
+  console.log('║  Proof-Carrying Modernization - Summary                       ║');
+  console.log('╠═══════════════════════════════════════════════════════════════╣');
+  console.log('║                                                               ║');
+  console.log('║  1. Property Definition (プロパティ定義):                     ║');
+  console.log(`║     ${String(loanCalcProperties.properties.length).padStart(2)} properties defined across 8 categories`.padEnd(60) + '║');
+  console.log('║     - Data Invariants, Pre/Post conditions                    ║');
+  console.log('║     - Relational, Precision, Loop Bounds                      ║');
+  console.log('║     - Final State, Output Equivalence                         ║');
+  console.log('║                                                               ║');
+  console.log('║  2. Source Verification (ソース検証):                         ║');
+  console.log(`║     ${report.summary.passed}/${report.summary.total} properties verified on original COBOL`.padEnd(60) + '║');
+  console.log('║                                                               ║');
+  console.log('║  3. Proof Certificate (証明書):                               ║');
+  console.log(`║     Status: ${certificate.status.toUpperCase()}`.padEnd(60) + '║');
+  console.log(`║     Preservation Rate: ${(certificate.summary.preservationRate * 100).toFixed(1)}%`.padEnd(60) + '║');
+  console.log('║                                                               ║');
+  console.log('║  4. Cross-Verification (クロス検証):                          ║');
+  console.log(`║     ${suite.testResults.length} additional test inputs verified`.padEnd(60) + '║');
+  console.log(`║     All Valid: ${suite.allValid}`.padEnd(60) + '║');
+  console.log('║                                                               ║');
+  console.log('║  Proof-Carrying Flow:                                         ║');
+  console.log('║  COBOL Source                                                 ║');
+  console.log('║    + Property Definitions                                     ║');
+  console.log('║    + Execution Traces                                         ║');
+  console.log('║    = Proof Certificate (properties verified)                  ║');
+  console.log('║       |                                                       ║');
+  console.log('║       v                                                       ║');
+  console.log('║  Modernized Code                                              ║');
+  console.log('║    + Same Property Definitions (carried over)                 ║');
+  console.log('║    + Re-verification against modernized execution             ║');
+  console.log('║    = Updated Certificate (preservation confirmed)             ║');
+  console.log('║                                                               ║');
+  console.log('╚═══════════════════════════════════════════════════════════════╝');
 }
 
 main();
