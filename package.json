@@ -2,10 +2,10 @@
   "name": "cobol-instrumented-interpreter-poc",
   "version": "0.1.0",
   "description": "POC: Type-safe instrumented COBOL subset interpreter for modernization",
-  "main": "dist/main.js",
+  "main": "dist/src/main.js",
   "scripts": {
     "build": "tsc",
-    "start": "tsc && node dist/main.js",
+    "start": "tsc && node dist/src/main.js",
     "test": "tsc && node dist/tests/run-tests.js"
   },
   "devDependencies": {
