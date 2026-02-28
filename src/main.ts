@@ -25,6 +25,8 @@ import {
   FormalVerificationPipeline,
   formatFormalCertificate, formatPhaseResults,
 } from './formal-verifier';
+import { SmtVerifier, formatSmtReport } from './smt-verifier';
+import { LeanIRGenerator } from './lean-ir';
 
 // ============================================================
 // サンプルCOBOLプログラム: ローン利息計算
@@ -651,6 +653,56 @@ function main(): void {
   console.log(formatFormalCertificate(formalExecution.certificate));
 
   // ========================================
+  // Phase 8: cvc5 SMT機械的形式検証
+  // ========================================
+  console.log('━━━ Phase 8: SMT Formal Verification (cvc5) ━━━');
+  console.log('');
+  console.log('  cvc5 SMT定理証明器でプロパティを機械的に検証する。');
+  console.log('  各プロパティをSMT-LIB 2形式に符号化し、充足不能性(UNSAT)を確認。');
+  console.log('  UNSAT = 反例が存在しない = プロパティは数学的定理として成立');
+  console.log('');
+
+  // Phase 1と同じ実行結果を再利用
+  const smtTracer = new ExecutionTracer();
+  const smtInterpreter = new CobolInterpreter(smtTracer);
+  const smtResult = smtInterpreter.execute(loanCalcProgram);
+
+  const smtLeanGen = new LeanIRGenerator(loanCalcProgram);
+  const smtFormalization = smtLeanGen.generate();
+
+  const smtVerifier = new SmtVerifier(
+    smtTracer.getEvents(),
+    smtResult.variables,
+    smtFormalization
+  );
+
+  console.log('  Running cvc5 on each property...');
+  const smtReport = smtVerifier.verify(loanCalcProperties);
+
+  // 各クエリの詳細
+  console.log('');
+  console.log('  --- SMT Queries and Results ---');
+  console.log('');
+  for (const r of smtReport.results) {
+    const icon = r.status === 'proven' ? '[UNSAT=PROVEN]' : r.status === 'falsified' ? '[SAT=FALSIFY]' : '[UNKNOWN]    ';
+    console.log(`  ${icon} ${r.propertyId.padEnd(10)} (${r.strategy})`);
+    console.log(`    Description:  ${r.description}`);
+    console.log(`    Explanation:  ${r.explanation}`);
+    console.log(`    Solver time:  ${r.durationMs}ms`);
+    // SMTクエリの最初の数行を表示
+    const queryPreview = r.smtQuery.split('\n')
+      .filter(l => l.trim() && !l.startsWith(';'))
+      .slice(0, 4)
+      .join(' | ');
+    if (queryPreview) {
+      console.log(`    Query:        ${queryPreview.substring(0, 80)}`);
+    }
+    console.log('');
+  }
+
+  console.log(formatSmtReport(smtReport));
+
+  // ========================================
   // 最終サマリー
   // ========================================
   console.log('╔═══════════════════════════════════════════════════════════════════════╗');
@@ -677,7 +729,12 @@ function main(): void {
   console.log(`║     Semantic equivalence: ${transSummary.equivalenceStatus}`.padEnd(68) + '║');
   console.log(`║     ${transSummary.preservedProperties}/${transSummary.totalProperties} properties preserved by bisimulation`.padEnd(68) + '║');
   console.log('║                                                                       ║');
-  console.log('║  6. Unified Confidence (統合信頼性):                                  ║');
+  console.log('║  6. SMT Formal Verification (cvc5機械的検証):                         ║');
+  console.log(`║     ${smtReport.summary.proven}/${smtReport.summary.total} properties formally proven by cvc5`.padEnd(68) + '║');
+  console.log(`║     Solver: ${smtReport.solverVersion}`.padEnd(68) + '║');
+  console.log(`║     Method: SMT-LIB 2, UNSAT = theorem proven`.padEnd(68) + '║');
+  console.log('║                                                                       ║');
+  console.log('║  7. Unified Confidence (統合信頼性):                                  ║');
   console.log(`║     ${formalExecution.certificate.confidenceLevel.toUpperCase()}`.padEnd(68) + '║');
   console.log('║                                                                       ║');
   console.log('║  Enhanced Proof-Carrying Flow:                                        ║');
