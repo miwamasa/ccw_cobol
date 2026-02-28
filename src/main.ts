@@ -7,6 +7,7 @@
  * 3. トレースからTypeScriptコードを生成
  * 4. Proof-Carrying: プロパティを定義し検証、Proof Certificateを生成
  * 5. 異なる入力でクロス検証を実行
+ * 6. Lean仲介による形式検証: 形式仕様生成、定理証明、統合証明書
  */
 
 import { CobolProgram } from './ast';
@@ -20,6 +21,10 @@ import {
 import { PropertyVerifier } from './verifier';
 import { ProofCertificateBuilder, formatCertificate } from './proof-certificate';
 import { CrossVerifier, formatCrossVerificationSuite, TestInput } from './cross-verifier';
+import {
+  FormalVerificationPipeline,
+  formatFormalCertificate, formatPhaseResults,
+} from './formal-verifier';
 
 // ============================================================
 // サンプルCOBOLプログラム: ローン利息計算
@@ -544,42 +549,156 @@ function main(): void {
   console.log(formatCrossVerificationSuite(suite));
 
   // ========================================
+  // Phase 7: Lean仲介による形式検証
+  // ========================================
+  console.log('━━━ Phase 7: Lean-Mediated Formal Verification ━━━');
+  console.log('');
+  console.log('  Lean 4定理証明系を中間言語として使い、プロパティの');
+  console.log('  形式的証明と変換正当性を統一的に扱う体系を構築する。');
+  console.log('');
+
+  const formalPipeline = new FormalVerificationPipeline(loanCalcProgram, loanCalcProperties);
+  const formalExecution = formalPipeline.execute();
+
+  // Phase実行結果
+  console.log(formatPhaseResults(formalExecution.phases));
+
+  // Phase 7a: Lean形式仕様の概要
+  console.log('━━━ Phase 7a: Lean 4 Formal Specification ━━━');
+  console.log('');
+  const leanSpec = formalExecution.certificate.leanFormalization;
+  console.log(`  Program State fields:  ${leanSpec.stats.totalFields}`);
+  console.log(`  Semantic functions:    ${leanSpec.stats.totalFunctions}`);
+  console.log(`  Type constraints:      ${leanSpec.stats.totalConstraints}`);
+  console.log(`  Lean source lines:     ${leanSpec.stats.totalLeanLines}`);
+  console.log('');
+
+  // State構造体のフィールド表示
+  console.log('  --- Lean State Fields ---');
+  for (const field of leanSpec.stateFields) {
+    console.log(`    ${field.cobolName.padEnd(20)} → ${field.leanName.padEnd(20)} : ${field.leanType}`);
+  }
+  console.log('');
+
+  // Type Constraints表示
+  console.log('  --- Type Constraints (PIC clause invariants) ---');
+  for (const tc of leanSpec.typeConstraints) {
+    console.log(`    [${tc.constraintType.padEnd(9)}] ${tc.description}`);
+  }
+  console.log('');
+
+  // Lean Source抜粋（先頭部分）
+  console.log('  --- Lean 4 Source (excerpt) ---');
+  const leanLines = leanSpec.leanSource.split('\n');
+  const excerptEnd = Math.min(40, leanLines.length);
+  for (let i = 0; i < excerptEnd; i++) {
+    console.log(`    ${leanLines[i]}`);
+  }
+  if (leanLines.length > excerptEnd) {
+    console.log(`    ... (${leanLines.length - excerptEnd} more lines)`);
+  }
+  console.log('');
+
+  // Phase 7b: Lean定理と証明
+  console.log('━━━ Phase 7b: Lean Theorems and Proofs ━━━');
+  console.log('');
+  const proofResult = formalExecution.certificate.formalProofs;
+  console.log(`  Total theorems:     ${proofResult.stats.totalTheorems}`);
+  console.log(`  Formal coverage:    ${(proofResult.stats.formalProofCoverage * 100).toFixed(1)}%`);
+  console.log(`  Runtime witnesses:  ${proofResult.stats.totalWitnesses}`);
+  console.log('');
+
+  // 各定理の概要
+  console.log('  --- Theorems ---');
+  for (const thm of proofResult.theorems) {
+    const levelIcon =
+      thm.proofLevel === 'decide' ? '[D]' :
+      thm.proofLevel === 'induction' ? '[I]' :
+      thm.proofLevel === 'refinement' ? '[R]' : '[A]';
+    console.log(`  ${levelIcon} ${thm.theoremName.padEnd(40)} ${thm.strategy.padEnd(18)} witnesses: ${thm.witnesses.length}`);
+    if (thm.witnesses.length > 0) {
+      const first = thm.witnesses[0];
+      console.log(`      witness: ${first.varName} = ${first.value} (${first.witnessType})`);
+    }
+  }
+  console.log('');
+
+  // Proof Level分布
+  console.log('  --- Proof Level Distribution ---');
+  for (const [level, count] of Object.entries(proofResult.stats.byLevel)) {
+    if (count > 0) {
+      const bar = '█'.repeat(count) + '░'.repeat(Math.max(0, 10 - count));
+      console.log(`    ${level.padEnd(12)} ${bar} ${count}`);
+    }
+  }
+  console.log('');
+
+  // Phase 7c: 変換正当性
+  console.log('━━━ Phase 7c: Transformation Correctness ━━━');
+  console.log('');
+  const transSummary = formalExecution.certificate.transformationSummary;
+  console.log(`  ${transSummary.sourceLang} → ${transSummary.targetLang}`);
+  console.log(`  Equivalence status:   ${transSummary.equivalenceStatus}`);
+  console.log(`  Properties preserved: ${transSummary.preservedProperties}/${transSummary.totalProperties}`);
+  console.log(`  Bisimulation via:`);
+  for (const comp of transSummary.bisimulationComponents) {
+    console.log(`    - ${comp}`);
+  }
+  console.log('');
+
+  // Phase 7d: 統合証明書
+  console.log('━━━ Phase 7d: Unified Formal Proof Certificate ━━━');
+  console.log(formatFormalCertificate(formalExecution.certificate));
+
+  // ========================================
   // 最終サマリー
   // ========================================
-  console.log('╔═══════════════════════════════════════════════════════════════╗');
-  console.log('║  Proof-Carrying Modernization - Summary                       ║');
-  console.log('╠═══════════════════════════════════════════════════════════════╣');
-  console.log('║                                                               ║');
-  console.log('║  1. Property Definition (プロパティ定義):                     ║');
-  console.log(`║     ${String(loanCalcProperties.properties.length).padStart(2)} properties defined across 8 categories`.padEnd(60) + '║');
-  console.log('║     - Data Invariants, Pre/Post conditions                    ║');
-  console.log('║     - Relational, Precision, Loop Bounds                      ║');
-  console.log('║     - Final State, Output Equivalence                         ║');
-  console.log('║                                                               ║');
-  console.log('║  2. Source Verification (ソース検証):                         ║');
-  console.log(`║     ${report.summary.passed}/${report.summary.total} properties verified on original COBOL`.padEnd(60) + '║');
-  console.log('║                                                               ║');
-  console.log('║  3. Proof Certificate (証明書):                               ║');
-  console.log(`║     Status: ${certificate.status.toUpperCase()}`.padEnd(60) + '║');
-  console.log(`║     Preservation Rate: ${(certificate.summary.preservationRate * 100).toFixed(1)}%`.padEnd(60) + '║');
-  console.log('║                                                               ║');
-  console.log('║  4. Cross-Verification (クロス検証):                          ║');
-  console.log(`║     ${suite.testResults.length} additional test inputs verified`.padEnd(60) + '║');
-  console.log(`║     All Valid: ${suite.allValid}`.padEnd(60) + '║');
-  console.log('║                                                               ║');
-  console.log('║  Proof-Carrying Flow:                                         ║');
-  console.log('║  COBOL Source                                                 ║');
-  console.log('║    + Property Definitions                                     ║');
-  console.log('║    + Execution Traces                                         ║');
-  console.log('║    = Proof Certificate (properties verified)                  ║');
-  console.log('║       |                                                       ║');
-  console.log('║       v                                                       ║');
-  console.log('║  Modernized Code                                              ║');
-  console.log('║    + Same Property Definitions (carried over)                 ║');
-  console.log('║    + Re-verification against modernized execution             ║');
-  console.log('║    = Updated Certificate (preservation confirmed)             ║');
-  console.log('║                                                               ║');
-  console.log('╚═══════════════════════════════════════════════════════════════╝');
+  console.log('╔═══════════════════════════════════════════════════════════════════════╗');
+  console.log('║  Proof-Carrying COBOL Modernization - Extended Summary               ║');
+  console.log('║  (with Lean-Mediated Formal Verification)                            ║');
+  console.log('╠═══════════════════════════════════════════════════════════════════════╣');
+  console.log('║                                                                       ║');
+  console.log('║  1. Property Definition (プロパティ定義):                             ║');
+  console.log(`║     ${String(loanCalcProperties.properties.length).padStart(2)} properties defined across 8 categories`.padEnd(68) + '║');
+  console.log('║                                                                       ║');
+  console.log('║  2. Runtime Verification (ランタイム検証):                            ║');
+  console.log(`║     ${report.summary.passed}/${report.summary.total} properties verified on original COBOL`.padEnd(68) + '║');
+  console.log('║                                                                       ║');
+  console.log('║  3. Lean Formal Specification (形式仕様):                             ║');
+  console.log(`║     ${leanSpec.stats.totalLeanLines} lines of Lean 4 code generated`.padEnd(68) + '║');
+  console.log(`║     ${leanSpec.stats.totalFunctions} semantic functions, ${leanSpec.stats.totalConstraints} type constraints`.padEnd(68) + '║');
+  console.log('║                                                                       ║');
+  console.log('║  4. Formal Proofs (形式証明):                                        ║');
+  console.log(`║     ${proofResult.stats.totalTheorems} theorems generated`.padEnd(68) + '║');
+  console.log(`║     ${(proofResult.stats.formalProofCoverage * 100).toFixed(0)}% formal proof coverage`.padEnd(68) + '║');
+  console.log(`║     ${proofResult.stats.totalWitnesses} runtime witnesses integrated`.padEnd(68) + '║');
+  console.log('║                                                                       ║');
+  console.log('║  5. Transformation Correctness (変換正当性):                          ║');
+  console.log(`║     Semantic equivalence: ${transSummary.equivalenceStatus}`.padEnd(68) + '║');
+  console.log(`║     ${transSummary.preservedProperties}/${transSummary.totalProperties} properties preserved by bisimulation`.padEnd(68) + '║');
+  console.log('║                                                                       ║');
+  console.log('║  6. Unified Confidence (統合信頼性):                                  ║');
+  console.log(`║     ${formalExecution.certificate.confidenceLevel.toUpperCase()}`.padEnd(68) + '║');
+  console.log('║                                                                       ║');
+  console.log('║  Enhanced Proof-Carrying Flow:                                        ║');
+  console.log('║                                                                       ║');
+  console.log('║  COBOL Source ──────────────────────────────────────────────┐          ║');
+  console.log('║    │                                                        │          ║');
+  console.log('║    ├─→ [Interpreter] ─→ Execution Traces ─→ Runtime Proof   │          ║');
+  console.log('║    │                                                        │          ║');
+  console.log('║    ├─→ [Lean IR Gen] ─→ Lean 4 Formal Spec                 │          ║');
+  console.log('║    │                       │                                │          ║');
+  console.log('║    │                       ├─ Property Theorems             │          ║');
+  console.log('║    │                       ├─ Type Constraints              │          ║');
+  console.log('║    │                       └─ Bisimulation Proof            │          ║');
+  console.log('║    │                                                        │          ║');
+  console.log('║    └─→ [CodeGen] ─→ TypeScript ─→ Preservation Proof       │          ║');
+  console.log('║                                                             │          ║');
+  console.log('║    ════════════════════════════════════════════════════      │          ║');
+  console.log('║    ▼ Unified Formal Proof Certificate                       │          ║');
+  console.log('║      Runtime + Formal + Bisimulation = Stronger Guarantee   │          ║');
+  console.log('║                                                                       ║');
+  console.log('╚═══════════════════════════════════════════════════════════════════════╝');
 }
 
 main();

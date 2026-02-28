@@ -17,6 +17,9 @@ import { PropertySet, varRef, lit, binOp, cmp, and } from '../src/properties';
 import { PropertyVerifier, VerificationReport } from '../src/verifier';
 import { ProofCertificateBuilder } from '../src/proof-certificate';
 import { CrossVerifier, TestInput } from '../src/cross-verifier';
+import { LeanIRGenerator, toLeanIdent } from '../src/lean-ir';
+import { LeanProofGenerator } from '../src/lean-proof-generator';
+import { FormalVerificationPipeline } from '../src/formal-verifier';
 
 // ============================================================
 // テストフレームワーク（軽量）
@@ -879,6 +882,380 @@ describe('Cross Verification', () => {
     assertEqual(suite.testResults.length, 2, 'test result count');
     assert(suite.mainCertificate.status === 'valid', 'main certificate should be valid');
     assert(suite.allValid, 'all tests should be valid');
+  });
+});
+
+// ============================================================
+// Lean IR Generation Tests
+// ============================================================
+
+describe('Lean IR Generation', () => {
+  it('should convert COBOL names to Lean identifiers', () => {
+    assertEqual(toLeanIdent('WS-BALANCE'), 'ws_balance', 'toLeanIdent hyphen');
+    assertEqual(toLeanIdent('CALC-MONTHLY-RATE'), 'calc_monthly_rate', 'toLeanIdent multi-hyphen');
+    assertEqual(toLeanIdent('LOAN-CALC'), 'loan_calc', 'toLeanIdent program id');
+  });
+
+  it('should generate Lean formalization for a simple program', () => {
+    const prog: CobolProgram = {
+      programId: 'TEST-LEAN',
+      dataItems: [
+        { nodeType: 'data-item', level: 1, name: 'WS-A', pic: '9(5)V99', value: 100.50, children: [] },
+        { nodeType: 'data-item', level: 1, name: 'WS-B', pic: 'X(10)', value: 'HELLO', children: [] },
+      ],
+      paragraphs: [{
+        name: 'ADD-ONE',
+        statements: [
+          { stmtType: 'add', values: [{ exprType: 'literal', value: 1 }], to: 'WS-A', rounded: false },
+        ],
+      }],
+      mainStatements: [
+        { stmtType: 'perform', paragraphName: 'ADD-ONE' },
+        { stmtType: 'stop-run' },
+      ],
+    };
+
+    const generator = new LeanIRGenerator(prog);
+    const result = generator.generate();
+
+    assertEqual(result.programId, 'TEST-LEAN', 'program ID');
+    assertEqual(result.stateFields.length, 2, 'state fields count');
+    assertEqual(result.semanticFunctions.length, 1, 'semantic functions count');
+    assert(result.typeConstraints.length >= 2, 'should have type constraints');
+    assert(result.stats.totalLeanLines > 0, 'should generate Lean source');
+
+    // Check field mapping
+    assertEqual(result.stateFields[0].cobolName, 'WS-A', 'first field COBOL name');
+    assertEqual(result.stateFields[0].leanName, 'ws_a', 'first field Lean name');
+    assert(result.stateFields[0].leanType.includes('FixedPoint'), 'numeric field should be FixedPoint');
+    assert(result.stateFields[1].leanType.includes('BoundedString'), 'alpha field should be BoundedString');
+
+    // Check Lean source contains key sections
+    assert(result.leanSource.includes('structure ProgramState'), 'should contain ProgramState');
+    assert(result.leanSource.includes('def initialState'), 'should contain initialState');
+    assert(result.leanSource.includes('sem_add_one'), 'should contain semantic function');
+    assert(result.leanSource.includes('namespace test_lean'), 'should contain namespace');
+  });
+
+  it('should derive type constraints from PIC clauses', () => {
+    const prog: CobolProgram = {
+      programId: 'TEST-CONSTRAINTS',
+      dataItems: [
+        { nodeType: 'data-item', level: 1, name: 'WS-SIGNED', pic: 'S9(5)V99', value: 0, children: [] },
+        { nodeType: 'data-item', level: 1, name: 'WS-UNSIGNED', pic: '9(3)', value: 0, children: [] },
+        { nodeType: 'data-item', level: 1, name: 'WS-TEXT', pic: 'X(20)', value: '', children: [] },
+      ],
+      paragraphs: [],
+      mainStatements: [{ stmtType: 'stop-run' }],
+    };
+
+    const generator = new LeanIRGenerator(prog);
+    const result = generator.generate();
+
+    // Signed numeric: range constraint
+    const signedConstraints = result.typeConstraints.filter(c => c.fieldName === 'ws_signed');
+    assert(signedConstraints.length >= 1, 'should have range constraint for signed');
+    assert(signedConstraints[0].leanExpr.includes('-'), 'signed range should include negative');
+
+    // Unsigned numeric: range constraint
+    const unsignedConstraints = result.typeConstraints.filter(c => c.fieldName === 'ws_unsigned');
+    assert(unsignedConstraints.length >= 1, 'should have range constraint for unsigned');
+    assert(unsignedConstraints[0].leanExpr.includes('0 ≤'), 'unsigned range should start at 0');
+
+    // String: length constraint
+    const textConstraints = result.typeConstraints.filter(c => c.fieldName === 'ws_text');
+    assert(textConstraints.length >= 1, 'should have length constraint for text');
+    assertEqual(textConstraints[0].constraintType, 'length', 'should be length constraint');
+  });
+});
+
+// ============================================================
+// Lean Proof Generation Tests
+// ============================================================
+
+describe('Lean Proof Generation', () => {
+  // Helper: create a simple program with properties
+  function createTestProgramAndProperties(): {
+    program: CobolProgram;
+    properties: PropertySet;
+  } {
+    const program: CobolProgram = {
+      programId: 'TEST-PROOFS',
+      dataItems: [
+        { nodeType: 'data-item', level: 1, name: 'WS-A', pic: '9(5)V99', value: 100, children: [] },
+        { nodeType: 'data-item', level: 1, name: 'WS-B', pic: '9(5)V99', value: 0, children: [] },
+        { nodeType: 'data-item', level: 1, name: 'WS-STATUS', pic: 'X(10)', value: 'INIT', children: [] },
+      ],
+      paragraphs: [{
+        name: 'CALC',
+        statements: [
+          { stmtType: 'compute', target: 'WS-B', expression: { exprType: 'binary', op: '+', left: { exprType: 'variable', name: 'WS-A' }, right: { exprType: 'literal', value: 50 } }, rounded: false },
+        ],
+      }],
+      mainStatements: [
+        { stmtType: 'perform', paragraphName: 'CALC' },
+        { stmtType: 'stop-run' },
+      ],
+    };
+
+    const properties: PropertySet = {
+      programId: 'TEST-PROOFS',
+      version: '1.0',
+      createdAt: '',
+      properties: [
+        {
+          propertyType: 'data-invariant', id: 'INV-T1',
+          description: 'WS-A >= 0', targetVar: 'WS-A',
+          condition: cmp('>=', varRef('WS-A'), lit(0)), checkAt: 'every-assignment',
+        },
+        {
+          propertyType: 'postcondition', id: 'POST-T1',
+          description: 'CALC後: WS-B > 0', paragraphName: 'CALC',
+          condition: cmp('>', varRef('WS-B'), lit(0)),
+        },
+      ],
+    };
+
+    return { program, properties };
+  }
+
+  it('should generate theorems for each property', () => {
+    const { program, properties } = createTestProgramAndProperties();
+
+    const tracer = new ExecutionTracer();
+    const interpreter = new CobolInterpreter(tracer);
+    const result = interpreter.execute(program);
+
+    const generator = new LeanIRGenerator(program);
+    const formalization = generator.generate();
+
+    const proofGen = new LeanProofGenerator(
+      formalization, properties, tracer.getEvents(), result.variables
+    );
+    const proofResult = proofGen.generateProofs();
+
+    assertEqual(proofResult.theorems.length, 2, 'should have 2 theorems');
+
+    // Check invariant theorem
+    const invThm = proofResult.theorems.find(t => t.propertyId === 'INV-T1');
+    assert(invThm !== undefined, 'should have invariant theorem');
+    assert(invThm!.theoremName.startsWith('invariant_'), 'invariant theorem name');
+    assert(invThm!.statement.includes('theorem'), 'should be a theorem statement');
+    assert(invThm!.proof.includes('by'), 'should have proof body');
+
+    // Check postcondition theorem
+    const postThm = proofResult.theorems.find(t => t.propertyId === 'POST-T1');
+    assert(postThm !== undefined, 'should have postcondition theorem');
+    assert(postThm!.theoremName.startsWith('postcondition_'), 'postcondition theorem name');
+  });
+
+  it('should collect runtime witnesses from execution traces', () => {
+    const { program, properties } = createTestProgramAndProperties();
+
+    const tracer = new ExecutionTracer();
+    const interpreter = new CobolInterpreter(tracer);
+    const result = interpreter.execute(program);
+
+    const generator = new LeanIRGenerator(program);
+    const formalization = generator.generate();
+
+    const proofGen = new LeanProofGenerator(
+      formalization, properties, tracer.getEvents(), result.variables
+    );
+    const proofResult = proofGen.generateProofs();
+
+    // Invariant theorem should have witnesses
+    const invThm = proofResult.theorems.find(t => t.propertyId === 'INV-T1');
+    assert(invThm!.witnesses.length > 0, 'invariant should have witnesses');
+
+    // At least an initial value witness
+    const initWitness = invThm!.witnesses.find(w => w.witnessType === 'initial-value');
+    assert(initWitness !== undefined, 'should have initial-value witness');
+    assertEqual(initWitness!.varName, 'WS-A', 'witness var name');
+  });
+
+  it('should generate transformation proof', () => {
+    const { program, properties } = createTestProgramAndProperties();
+
+    const tracer = new ExecutionTracer();
+    const interpreter = new CobolInterpreter(tracer);
+    const result = interpreter.execute(program);
+
+    const generator = new LeanIRGenerator(program);
+    const formalization = generator.generate();
+
+    const proofGen = new LeanProofGenerator(
+      formalization, properties, tracer.getEvents(), result.variables
+    );
+    const proofResult = proofGen.generateProofs();
+
+    const transProof = proofResult.transformationProof;
+    assertEqual(transProof.sourceLang, 'COBOL', 'source lang');
+    assertEqual(transProof.targetLang, 'TypeScript', 'target lang');
+    assert(transProof.equivalenceTheorem.theoremName === 'semantic_equivalence', 'equiv theorem name');
+    assertEqual(transProof.preservationTheorems.length, 2, 'preservation theorems count');
+    assert(transProof.preservationTheorems[0].theoremName.startsWith('preservation_'), 'preservation theorem name');
+  });
+
+  it('should compute proof statistics', () => {
+    const { program, properties } = createTestProgramAndProperties();
+
+    const tracer = new ExecutionTracer();
+    const interpreter = new CobolInterpreter(tracer);
+    const result = interpreter.execute(program);
+
+    const generator = new LeanIRGenerator(program);
+    const formalization = generator.generate();
+
+    const proofGen = new LeanProofGenerator(
+      formalization, properties, tracer.getEvents(), result.variables
+    );
+    const proofResult = proofGen.generateProofs();
+
+    assertEqual(proofResult.stats.totalTheorems, 2, 'total theorems');
+    assert(proofResult.stats.formalProofCoverage > 0, 'formal coverage should be > 0');
+    assert(proofResult.stats.totalWitnesses > 0, 'should have witnesses');
+    assert(proofResult.leanProofSource.length > 0, 'should have Lean proof source');
+  });
+});
+
+// ============================================================
+// Formal Verification Pipeline Tests
+// ============================================================
+
+describe('Formal Verification Pipeline', () => {
+  function createLoanCalcProgram(): CobolProgram {
+    return {
+      programId: 'LOAN-CALC-TEST',
+      dataItems: [
+        { nodeType: 'data-item', level: 1, name: 'WS-PRINCIPAL', pic: 'S9(7)V99', value: 100000, children: [] },
+        { nodeType: 'data-item', level: 1, name: 'WS-ANNUAL-RATE', pic: '9(2)V9(4)', value: 3.5, children: [] },
+        { nodeType: 'data-item', level: 1, name: 'WS-MONTHLY-RATE', pic: '9(2)V9(6)', children: [] },
+        { nodeType: 'data-item', level: 1, name: 'WS-PAYMENT', pic: '9(7)V99', children: [] },
+        { nodeType: 'data-item', level: 1, name: 'WS-TEMP', pic: '9(9)V9(4)', children: [] },
+        { nodeType: 'data-item', level: 1, name: 'WS-TOTAL-INTEREST', pic: '9(9)V99', value: 0, children: [] },
+        { nodeType: 'data-item', level: 1, name: 'WS-BALANCE', pic: '9(9)V99', children: [] },
+        { nodeType: 'data-item', level: 1, name: 'WS-INTEREST-AMT', pic: '9(7)V99', children: [] },
+        { nodeType: 'data-item', level: 1, name: 'WS-PRINCIPAL-AMT', pic: '9(7)V99', children: [] },
+        { nodeType: 'data-item', level: 1, name: 'WS-MONTH-CTR', pic: '9(3)', children: [] },
+        { nodeType: 'data-item', level: 1, name: 'WS-STATUS', pic: 'X(10)', value: 'ACTIVE', children: [] },
+      ],
+      paragraphs: [
+        {
+          name: 'CALC-MONTHLY-RATE',
+          statements: [{
+            stmtType: 'compute', target: 'WS-MONTHLY-RATE',
+            expression: { exprType: 'binary', op: '/', left: { exprType: 'binary', op: '/', left: { exprType: 'variable', name: 'WS-ANNUAL-RATE' }, right: { exprType: 'literal', value: 100 } }, right: { exprType: 'literal', value: 12 } },
+            rounded: true,
+          }],
+        },
+        {
+          name: 'CALC-PAYMENT',
+          statements: [
+            { stmtType: 'compute', target: 'WS-TEMP', expression: { exprType: 'binary', op: '*', left: { exprType: 'variable', name: 'WS-MONTHLY-RATE' }, right: { exprType: 'variable', name: 'WS-PRINCIPAL' } }, rounded: false },
+            { stmtType: 'compute', target: 'WS-PAYMENT', expression: { exprType: 'variable', name: 'WS-TEMP' }, rounded: true },
+          ],
+        },
+      ],
+      mainStatements: [
+        { stmtType: 'perform', paragraphName: 'CALC-MONTHLY-RATE' },
+        { stmtType: 'perform', paragraphName: 'CALC-PAYMENT' },
+        { stmtType: 'stop-run' },
+      ],
+    };
+  }
+
+  it('should execute unified formal verification pipeline', () => {
+    const program = createLoanCalcProgram();
+    const properties: PropertySet = {
+      programId: 'LOAN-CALC-TEST', version: '1.0', createdAt: '',
+      properties: [
+        {
+          propertyType: 'data-invariant', id: 'INV-LT1',
+          description: 'WS-TOTAL-INTEREST >= 0', targetVar: 'WS-TOTAL-INTEREST',
+          condition: cmp('>=', varRef('WS-TOTAL-INTEREST'), lit(0)), checkAt: 'every-assignment',
+        },
+        {
+          propertyType: 'precondition', id: 'PRE-LT1',
+          description: 'CALC-MONTHLY-RATE前: rate > 0', paragraphName: 'CALC-MONTHLY-RATE',
+          condition: cmp('>', varRef('WS-ANNUAL-RATE'), lit(0)),
+        },
+        {
+          propertyType: 'postcondition', id: 'POST-LT1',
+          description: 'CALC-MONTHLY-RATE後: monthly > 0', paragraphName: 'CALC-MONTHLY-RATE',
+          condition: cmp('>', varRef('WS-MONTHLY-RATE'), lit(0)),
+        },
+      ],
+    };
+
+    const pipeline = new FormalVerificationPipeline(program, properties);
+    const execution = pipeline.execute();
+
+    // Check pipeline phases
+    assertEqual(execution.phases.length, 4, 'should have 4 phases');
+    assert(execution.phases.every(p => p.status !== 'failed'), 'no phase should fail');
+
+    // Check certificate
+    const cert = execution.certificate;
+    assertEqual(cert.programId, 'LOAN-CALC-TEST', 'cert program ID');
+    assert(cert.confidenceLevel !== 'runtime-only', 'should be better than runtime-only');
+
+    // Check unified results
+    assertEqual(cert.unifiedResults.length, 3, 'should have 3 unified results');
+    assert(cert.unifiedResults.every(r => r.runtimeStatus === 'passed'), 'all runtime should pass');
+    assert(cert.unifiedResults.every(r => r.formalStatus !== 'not-formalized'), 'all should be formalized');
+
+    // Check Lean artifacts
+    assert(cert.leanFormalization.stats.totalLeanLines > 0, 'should have Lean source');
+    assert(cert.formalProofs.stats.totalTheorems >= 3, 'should have >= 3 theorems');
+    assert(cert.formalProofs.leanProofSource.length > 0, 'should have proof source');
+  });
+
+  it('should determine confidence level correctly', () => {
+    const program = createLoanCalcProgram();
+    const properties: PropertySet = {
+      programId: 'LOAN-CALC-TEST', version: '1.0', createdAt: '',
+      properties: [
+        {
+          propertyType: 'data-invariant', id: 'INV-CL1',
+          description: 'WS-TOTAL-INTEREST >= 0', targetVar: 'WS-TOTAL-INTEREST',
+          condition: cmp('>=', varRef('WS-TOTAL-INTEREST'), lit(0)), checkAt: 'every-assignment',
+        },
+      ],
+    };
+
+    const pipeline = new FormalVerificationPipeline(program, properties);
+    const execution = pipeline.execute();
+
+    // With formalization, should be at least partially-formal
+    const level = execution.certificate.confidenceLevel;
+    assert(
+      level === 'partially-formal' || level === 'formally-verified' || level === 'runtime-with-sketch',
+      `confidence should be elevated, got: ${level}`
+    );
+  });
+
+  it('should include transformation correctness in certificate', () => {
+    const program = createLoanCalcProgram();
+    const properties: PropertySet = {
+      programId: 'LOAN-CALC-TEST', version: '1.0', createdAt: '',
+      properties: [
+        {
+          propertyType: 'postcondition', id: 'POST-TC1',
+          description: 'payment > 0', paragraphName: 'CALC-PAYMENT',
+          condition: cmp('>', varRef('WS-PAYMENT'), lit(0)),
+        },
+      ],
+    };
+
+    const pipeline = new FormalVerificationPipeline(program, properties);
+    const execution = pipeline.execute();
+
+    const transSummary = execution.certificate.transformationSummary;
+    assertEqual(transSummary.sourceLang, 'COBOL', 'source lang');
+    assertEqual(transSummary.targetLang, 'TypeScript', 'target lang');
+    assert(transSummary.preservedProperties > 0, 'should have preserved properties');
+    assert(transSummary.bisimulationComponents.length > 0, 'should have bisimulation components');
   });
 });
 
