@@ -20,6 +20,7 @@ import { CrossVerifier, TestInput } from '../src/cross-verifier';
 import { LeanIRGenerator, toLeanIdent } from '../src/lean-ir';
 import { LeanProofGenerator } from '../src/lean-proof-generator';
 import { FormalVerificationPipeline } from '../src/formal-verifier';
+import { SmtVerifier, formatSmtReport } from '../src/smt-verifier';
 
 // ============================================================
 // テストフレームワーク（軽量）
@@ -1123,9 +1124,9 @@ describe('Lean Proof Generation', () => {
 // Formal Verification Pipeline Tests
 // ============================================================
 
-describe('Formal Verification Pipeline', () => {
-  function createLoanCalcProgram(): CobolProgram {
-    return {
+/** Shared helper for Formal Verification and SMT Verification tests */
+function createLoanCalcProgram(): CobolProgram {
+  return {
       programId: 'LOAN-CALC-TEST',
       dataItems: [
         { nodeType: 'data-item', level: 1, name: 'WS-PRINCIPAL', pic: 'S9(7)V99', value: 100000, children: [] },
@@ -1163,8 +1164,9 @@ describe('Formal Verification Pipeline', () => {
         { stmtType: 'stop-run' },
       ],
     };
-  }
+}
 
+describe('Formal Verification Pipeline', () => {
   it('should execute unified formal verification pipeline', () => {
     const program = createLoanCalcProgram();
     const properties: PropertySet = {
@@ -1256,6 +1258,152 @@ describe('Formal Verification Pipeline', () => {
     assertEqual(transSummary.targetLang, 'TypeScript', 'target lang');
     assert(transSummary.preservedProperties > 0, 'should have preserved properties');
     assert(transSummary.bisimulationComponents.length > 0, 'should have bisimulation components');
+  });
+});
+
+// ============================================================
+// SMT Verification Tests (cvc5)
+// ============================================================
+
+describe('SMT Verification (cvc5)', () => {
+  /** Shared setup: run the LOAN-CALC program once and build the SMT verifier */
+  function buildSmtVerifier() {
+    const program = createLoanCalcProgram();
+    const tracer = new ExecutionTracer();
+    const interp = new CobolInterpreter(tracer);
+    const result = interp.execute(program);
+
+    const events = tracer.getEvents();
+    const finalVars = result.variables;
+    const leanGen = new LeanIRGenerator(program);
+    const formalization = leanGen.generate();
+
+    return new SmtVerifier(events, finalVars, formalization);
+  }
+
+  it('should instantiate SmtVerifier from program execution', () => {
+    const verifier = buildSmtVerifier();
+    assert(verifier !== null, 'SmtVerifier should be created');
+  });
+
+  it('should prove precondition PRE-01 (WS-ANNUAL-RATE > 0 before CALC-MONTHLY-RATE)', () => {
+    const verifier = buildSmtVerifier();
+    const propertySet: PropertySet = {
+      programId: 'LOAN-CALC-TEST', version: '1.0', createdAt: '',
+      properties: [{
+        propertyType: 'precondition', id: 'PRE-01',
+        description: 'CALC-MONTHLY-RATE 呼出前: WS-ANNUAL-RATE > 0',
+        paragraphName: 'CALC-MONTHLY-RATE',
+        condition: cmp('>', varRef('WS-ANNUAL-RATE'), lit(0)),
+      }],
+    };
+    const report = verifier.verify(propertySet);
+    const result = report.results[0];
+    assertEqual(result.status, 'proven', 'PRE-01 should be proven by cvc5');
+    assertEqual(result.answer, 'unsat', 'PRE-01 cvc5 answer should be unsat');
+  });
+
+  it('should prove loop bound LOOP-01 (CALC-AMORTIZATION runs <= 12 times)', () => {
+    const verifier = buildSmtVerifier();
+    const propertySet: PropertySet = {
+      programId: 'LOAN-CALC-TEST', version: '1.0', createdAt: '',
+      properties: [{
+        propertyType: 'loop-bound', id: 'LOOP-01',
+        description: 'CALC-AMORTIZATION ループは 12 回で終了する',
+        paragraphName: 'CALC-AMORTIZATION',
+        maxIterations: 12,
+      }],
+    };
+    const report = verifier.verify(propertySet);
+    const result = report.results[0];
+    assertEqual(result.status, 'proven', 'LOOP-01 should be proven by cvc5');
+  });
+
+  it('should prove data invariant INV-01 (WS-TOTAL-INTEREST >= 0) inductively', () => {
+    // For the inductive proof to work, WS-TOTAL-INTEREST must have ADD operations
+    // in the trace (so getOperationsOnVar returns non-empty).
+    // We build a specialized program with CALC-AMORTIZATION that adds to WS-TOTAL-INTEREST.
+    const program = createLoanCalcProgram();
+    // Add a paragraph that ADDs WS-INTEREST-AMT to WS-TOTAL-INTEREST
+    const programWithAdd = {
+      ...program,
+      paragraphs: [
+        ...program.paragraphs,
+        {
+          name: 'CALC-AMORTIZATION',
+          statements: [{
+            stmtType: 'add' as const,
+            values: [{ exprType: 'variable' as const, name: 'WS-INTEREST-AMT' }],
+            to: 'WS-TOTAL-INTEREST',
+            rounded: false,
+          }],
+        },
+      ],
+      mainStatements: [
+        { stmtType: 'perform' as const, paragraphName: 'CALC-MONTHLY-RATE' },
+        { stmtType: 'perform' as const, paragraphName: 'CALC-AMORTIZATION' },
+        { stmtType: 'stop-run' as const },
+      ],
+    };
+    const tracer = new ExecutionTracer();
+    const interp = new CobolInterpreter(tracer);
+    const result = interp.execute(programWithAdd);
+    const events = tracer.getEvents();
+    const leanGen = new LeanIRGenerator(program);
+    const formalization = leanGen.generate();
+    const verifier = new SmtVerifier(events, result.variables, formalization);
+
+    const propertySet: PropertySet = {
+      programId: 'LOAN-CALC-TEST', version: '1.0', createdAt: '',
+      properties: [{
+        propertyType: 'data-invariant', id: 'INV-01',
+        description: 'WS-TOTAL-INTEREST は常に 0 以上',
+        targetVar: 'WS-TOTAL-INTEREST',
+        condition: cmp('>=', varRef('WS-TOTAL-INTEREST'), lit(0)),
+        checkAt: 'every-assignment',
+      }],
+    };
+    const report = verifier.verify(propertySet);
+    const res = report.results[0];
+    assertEqual(res.status, 'proven', 'INV-01 should be proven by cvc5 inductive step');
+    assertEqual(res.strategy, 'inductive-step', 'should use inductive-step strategy');
+  });
+
+  it('should generate valid SMT-LIB 2 queries (no scientific notation)', () => {
+    const verifier = buildSmtVerifier();
+    const propertySet: PropertySet = {
+      programId: 'LOAN-CALC-TEST', version: '1.0', createdAt: '',
+      properties: [{
+        propertyType: 'precision', id: 'PREC-01',
+        description: 'WS-MONTHLY-RATE ROUNDED',
+        targetVar: 'WS-MONTHLY-RATE',
+        minDecimalPlaces: 6,
+        roundingMode: 'must-round',
+      }],
+    };
+    const report = verifier.verify(propertySet);
+    const query = report.results[0].smtQuery;
+    // SMT-LIB 2 does not support scientific notation like 5e-7 or 1e+3
+    // Pattern: digit followed by 'e' followed by sign and digit (e.g., "5e-7", "1.2e+6")
+    assert(!/\de[-+]\d/.test(query), 'query should not contain scientific notation (e.g. 5e-7 or 1e+3)');
+    assertEqual(report.results[0].status, 'proven', 'PREC-01 should be proven');
+  });
+
+  it('should format SMT report with all results', () => {
+    const verifier = buildSmtVerifier();
+    const propertySet: PropertySet = {
+      programId: 'LOAN-CALC-TEST', version: '1.0', createdAt: '',
+      properties: [
+        { propertyType: 'loop-bound', id: 'LOOP-T1', description: 'loop', paragraphName: 'CALC-AMORTIZATION', maxIterations: 12 },
+        { propertyType: 'precondition', id: 'PRE-T1', description: 'pre', paragraphName: 'CALC-MONTHLY-RATE', condition: cmp('>', varRef('WS-ANNUAL-RATE'), lit(0)) },
+      ],
+    };
+    const report = verifier.verify(propertySet);
+    const formatted = formatSmtReport(report);
+    assert(formatted.includes('SMT FORMAL VERIFICATION REPORT'), 'report header present');
+    assert(formatted.includes('cvc5'), 'solver name present');
+    assert(formatted.includes('Proven:'), 'proven count present');
+    assert(report.summary.proven === 2, `expected 2 proven, got ${report.summary.proven}`);
   });
 });
 
